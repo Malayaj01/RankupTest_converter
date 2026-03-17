@@ -1,0 +1,13 @@
+.git
+backend/venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.vscode
+.idea
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+sample_questions.xlsx

@@ -12,23 +12,49 @@ import traceback
 app = Flask(__name__, static_folder='../frontend', static_url_path='')
 CORS(app)
 
+# Limit upload size to 5 MB
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
+
 @app.route('/')
 def index():
     return send_file('../frontend/index.html')
 
-def find_edge_binary():
-    # Common paths for Edge
-    paths = [
+def find_chrome_binary():
+    """Find Chrome or Chromium binary — works on both Windows and Linux."""
+    
+    # Linux paths (Docker / cloud servers)
+    linux_paths = [
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+    ]
+    
+    # Windows paths (local development)
+    windows_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     ]
+    
     # Check PATH first
-    if shutil.which("msedge"):
-        return "msedge"
-        
+    for name in ['chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable']:
+        if shutil.which(name):
+            return shutil.which(name)
+    
+    # Windows: also check Edge (compatible flags)
+    if os.name == 'nt':
+        for name in ['chrome', 'msedge']:
+            if shutil.which(name):
+                return shutil.which(name)
+    
+    # Check known paths
+    paths = linux_paths if os.name != 'nt' else windows_paths
     for path in paths:
         if os.path.exists(path):
             return path
+    
     return None
 
 def generate_html_pdf(df, output_path, exam_name='Exam Name'):
@@ -97,7 +123,7 @@ def generate_html_pdf(df, output_path, exam_name='Exam Name'):
                 column-gap: 40px;
                 column-rule: 1px solid #ccc;
                 text-align: left;
-                margin-top: 0; /* Removing margin as we now use spacer row in thead */
+                margin-top: 0;
             }
             
             .question-block {
@@ -214,7 +240,6 @@ def generate_html_pdf(df, output_path, exam_name='Exam Name'):
     
     # Watermark logic
     watermark_path = os.path.join(base_dir, 'watermark.png')
-    # If watermark file exists, use it. Otherwise use a placeholder (or empty)
     watermark_url = ''
     if os.path.exists(watermark_path):
         watermark_url = 'file:///' + watermark_path.replace('\\', '/')
@@ -223,7 +248,6 @@ def generate_html_pdf(df, output_path, exam_name='Exam Name'):
         template, 
         questions=records, 
         exam_name=exam_name,
-        date=pd.Timestamp.now().strftime("%Y-%m-%d"),
         font_path_regular='file:///' + font_reg,
         font_path_italic='file:///' + font_it,
         watermark_url=watermark_url
@@ -234,54 +258,45 @@ def generate_html_pdf(df, output_path, exam_name='Exam Name'):
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(html_content)
         
-    edge_bin = find_edge_binary()
-    if not edge_bin:
-        raise Exception("Microsoft Edge not found. Please install Edge to generate PDFs.")
+    chrome_bin = find_chrome_binary()
+    if not chrome_bin:
+        raise Exception("Chrome/Chromium not found. Please install Chrome or Chromium to generate PDFs.")
         
-    # Convert Windows path to a proper file URI so Edge can load it reliably
+    # Convert path to a proper file URI
     html_file_url = f"file:///{html_file.replace(os.sep, '/')}"
     
-    # Create a temporary user data dir to isolate this Edge instance
-    # This prevents Edge from delegating to an already running foreground process and exiting instantly
-    user_data_dir = tempfile.mkdtemp(prefix="edge_temp_")
+    # Create a temporary user data dir to isolate this browser instance
+    user_data_dir = tempfile.mkdtemp(prefix="chrome_temp_")
     
-    # Edge Command
-    # --print-to-pdf: Output file
-    # --no-pdf-header-footer: Removes URL/Time from top/bottom
+    # Chrome/Chromium command (flags are compatible with Edge)
     cmd = [
-        edge_bin,
+        chrome_bin,
         '--headless=new',
         '--disable-gpu',
         '--no-sandbox',
         '--no-first-run',
         '--no-pdf-header-footer',
-        '--allow-file-access-from-files',  # Allows loading local fonts and watermark
+        '--allow-file-access-from-files',
         '--disable-extensions',
         '--disable-background-networking',
         '--disable-sync',
         '--disable-default-apps',
         '--disable-component-update',
-        '--disable-features=msEdgeEnableNurturingFramework,RendererCodeIntegrity,msUndersideButton',
-        f'--user-data-dir={user_data_dir}', # Isolates the process
+        '--disable-dev-shm-usage',       # Important for Docker (shared memory)
+        '--disable-software-rasterizer',
+        f'--user-data-dir={user_data_dir}',
         f'--print-to-pdf={output_path}',
         html_file_url
     ]
     
     try:
-        # Provide CREATE_NO_WINDOW flag on Windows to detach from the parent console
         creation_flags = 0x08000000 if os.name == 'nt' else 0
-        print(f"DEBUG: Running Edge command: {' '.join(cmd)}")
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             creationflags=creation_flags, timeout=60
         )
-        print(f"DEBUG: Edge exit code: {result.returncode}")
-        if result.stdout:
-            print(f"DEBUG: Edge stdout: {result.stdout}")
-        if result.stderr:
-            print(f"DEBUG: Edge stderr: {result.stderr}")
         
-        # Edge may delegate the print job asynchronously — poll for the PDF
+        # Browser may delegate the print job asynchronously — poll for the PDF
         max_wait = 15  # seconds
         poll_interval = 0.5
         waited = 0
@@ -292,11 +307,10 @@ def generate_html_pdf(df, output_path, exam_name='Exam Name'):
             waited += poll_interval
         
         pdf_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        print(f"DEBUG: PDF at {output_path}, size: {pdf_size} bytes (waited {waited}s)")
         
         if pdf_size == 0:
-            err_msg = result.stderr or result.stdout or "No output from Edge"
-            raise Exception(f"Edge PDF generation failed. Edge output: {err_msg}")
+            err_msg = result.stderr or result.stdout or "No output from Chrome/Chromium"
+            raise Exception(f"PDF generation failed. Browser output: {err_msg}")
     finally:
         if os.path.exists(html_file):
             os.remove(html_file)
@@ -324,19 +338,14 @@ def convert_to_pdf():
             if not all(col in df.columns for col in required_cols):
                 return jsonify({'error': f'Missing columns. Required: {required_cols}'}), 400
             
-            # Generate PDF via Edge
+            # Generate PDF via Chrome/Chromium
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_pdf:
                 pdf_path = tmp_pdf.name
                 
             exam_name = request.form.get('exam_name', 'Exam Name')
             generate_html_pdf(df, pdf_path, exam_name)
             
-            # Print file size for debugging
-            print(f"DEBUG: PDF generated at {pdf_path}, size: {os.path.getsize(pdf_path)} bytes")
-            
-            # Send file and then delete (requires some tricky cleanup in Flask usually, 
-            # using clean up callback or byteio if file is small. 
-            # For simplicity, we read to memory and delete.)
+            # Read PDF to memory and clean up temp file
             with open(pdf_path, 'rb') as f:
                 data = io.BytesIO(f.read())
             
@@ -354,4 +363,4 @@ def convert_to_pdf():
             return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=False, port=5001)
